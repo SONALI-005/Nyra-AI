@@ -1,0 +1,353 @@
+# Implementation Plan: NYRA AI Companion
+
+## Overview
+
+Incremental implementation of the NYRA safety and wellbeing companion. Tasks are ordered to establish the foundation first (auth, data models, project structure), then build each module independently, and finally wire everything together through the AI Engine and Notification Service.
+
+All code is TypeScript (Node.js/Express backend + React Native client). Property-based tests use **fast-check** with a minimum of 100 iterations per property.
+
+---
+
+## Tasks
+
+- [x] 1. Project structure and shared foundations
+  - Scaffold the monorepo: `backend/` (Node.js/Express) and `client/` (React Native) directories
+  - Set up TypeScript configs, ESLint, Prettier, and Jest + fast-check for both packages
+  - Define all shared TypeScript interfaces from the design (`User`, `EmergencyContact`, `SOSEvent`, `CheckIn`, `MoodLog`, `Task`, `SafetyTip`, `GeoPoint`, `ConversationSession`, `NotificationPreferences`)
+  - Create a shared `ValidationError` response shape used across all modules
+  - Set up the database schema (migrations) for all data models
+  - _Requirements: 9.3 (AES-256 encryption at rest), all modules_
+
+- [x] 2. Auth Service
+  - [x] 2.1 Implement registration, login, logout, and token refresh endpoints
+    - `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `POST /auth/refresh`
+    - Hash passwords with bcrypt; issue JWT session tokens
+    - Encrypt `email` at rest with AES-256
+    - _Requirements: 9.1_
+  - [x] 2.2 Implement session inactivity timeout (10 minutes)
+    - Track `lastActiveAt` on each request; invalidate session and return `401 { reason: "SESSION_EXPIRED" }` after 10 min of inactivity
+    - _Requirements: 9.2_
+  - [x] 2.3 Implement permissions endpoints
+    - `GET /auth/permissions` and `PUT /auth/permissions`
+    - Immediately reflect updated `locationPermissionGranted` / `notificationPermissionGranted` state
+    - _Requirements: 9.6_
+  - [x] 2.4 Implement account deletion
+    - `DELETE /auth/account` — schedule permanent deletion of all user data within 30 days
+    - _Requirements: 9.4_
+  - [ ]* 2.5 Write property test for unauthenticated request rejection (Property 29)
+    - **Property 29: Unauthenticated requests are rejected**
+    - **Validates: Requirements 9.1**
+  - [ ]* 2.6 Write property test for session inactivity timeout (Property 30)
+    - **Property 30: Session inactivity timeout**
+    - **Validates: Requirements 9.2**
+  - [ ]* 2.7 Write property test for location permission state (Property 31)
+    - **Property 31: Location permission state reflects immediately**
+    - **Validates: Requirements 9.6**
+  - [ ]* 2.8 Write unit tests for Auth Service
+    - Test registration/login happy paths and error conditions
+    - Test account deletion scheduling
+    - _Requirements: 9.1, 9.4_
+
+- [x] 3. Checkpoint — Auth baseline
+  - Ensure all auth tests pass, ask the user if questions arise.
+
+- [x] 4. Notification Service
+  - [x] 4.1 Implement the internal `notify(userId, type, payload)` service
+    - Integrate FCM/APNs push delivery
+    - Fall back to in-app banner when OS notification permission is denied
+    - _Requirements: 10.1, 10.4_
+  - [x] 4.2 Implement notification preference enforcement
+    - Read `NotificationPreferences` before dispatching; skip disabled categories
+    - Apply preference updates within the same session without restart
+    - _Requirements: 10.2, 10.3_
+  - [x] 4.3 Implement SOS-active suppression logic
+    - When an SOS event is active, suppress `task_due`, `daily_tip`, and `checkin_reminder` notification types
+    - _Requirements: 10.5_
+  - [ ]* 4.4 Write property test for notification preference enforcement (Property 32)
+    - **Property 32: Notification preferences are respected**
+    - **Validates: Requirements 10.2, 10.3**
+  - [ ]* 4.5 Write property test for SOS suppression (Property 33)
+    - **Property 33: SOS event suppresses non-critical notifications**
+    - **Validates: Requirements 10.5**
+  - [ ]* 4.6 Write unit tests for Notification Service
+    - Test in-app banner fallback when OS permission denied
+    - _Requirements: 10.4_
+
+- [x] 5. Safety Module — Emergency Contacts
+  - [x] 5.1 Implement emergency contact CRUD endpoints
+    - `POST /safety/contacts`, `PUT /safety/contacts/:id`, `DELETE /safety/contacts/:id`, `GET /safety/contacts`
+    - Encrypt `name`, `phone`, `email` at rest with AES-256
+    - Enforce max 5 contacts per user
+    - _Requirements: 2.1, 2.3, 9.3_
+  - [x] 5.2 Implement contact validation
+    - Require `name` and at least one of `phone` (E.164) or `email`; return `VALIDATION_ERROR` on failure
+    - _Requirements: 2.2, 2.5_
+  - [x] 5.3 Send confirmation notification on contact add
+    - Call Notification Service with `contact_alert` payload to the new contact's phone/email
+    - _Requirements: 2.4_
+  - [ ]* 5.4 Write property test for contact CRUD round-trip (Property 4)
+    - **Property 4: Emergency contact CRUD round-trip**
+    - **Validates: Requirements 2.1**
+  - [ ]* 5.5 Write property test for contact validation (Property 5)
+    - **Property 5: Emergency contact validation**
+    - **Validates: Requirements 2.2, 2.5**
+  - [ ]* 5.6 Write property test for contact capacity (Property 6)
+    - **Property 6: Emergency contact capacity**
+    - **Validates: Requirements 2.3**
+  - [ ]* 5.7 Write property test for confirmation notification (Property 7)
+    - **Property 7: Emergency contact confirmation notification**
+    - **Validates: Requirements 2.4**
+
+- [x] 6. Safety Module — SOS
+  - [x] 6.1 Implement SOS trigger endpoint
+    - `POST /safety/sos/trigger` — create `SOSEvent`, capture initial GPS, write alert records to offline queue, dispatch alerts to all contacts within 10 s
+    - _Requirements: 1.1, 1.2, 1.3_
+  - [x] 6.2 Implement offline SOS queue and background sync worker
+    - Write alerts to durable local queue before network call; flush queue when connectivity is restored
+    - _Requirements: 1.4_
+  - [x] 6.3 Implement continuous location tracking during SOS
+    - Append `LocationUpdate` records to the active `SOSEvent` while it is active
+    - _Requirements: 1.5_
+  - [x] 6.4 Implement SOS cancel endpoint
+    - `POST /safety/sos/cancel` — set `cancelledAt`, stop location tracking, notify contacts that user is safe
+    - _Requirements: 1.6_
+  - [x] 6.5 Implement `GET /safety/sos/status`
+    - Return current SOS state for the authenticated user
+    - _Requirements: 1.1_
+  - [ ]* 6.6 Write property test for SOS alert delivery completeness (Property 1)
+    - **Property 1: SOS alert delivery completeness and location inclusion**
+    - **Validates: Requirements 1.1, 1.2**
+  - [ ]* 6.7 Write property test for offline SOS queuing round-trip (Property 2)
+    - **Property 2: Offline SOS queuing round-trip**
+    - **Validates: Requirements 1.4**
+  - [ ]* 6.8 Write property test for SOS location tracking lifecycle (Property 3)
+    - **Property 3: SOS location tracking lifecycle**
+    - **Validates: Requirements 1.5, 1.6**
+
+- [x] 7. Checkpoint — SOS and contacts
+  - Ensure all safety module tests pass, ask the user if questions arise.
+
+- [x] 8. Safety Module — Safe Routes
+  - [x] 8.1 Implement safe route request endpoint
+    - `POST /safety/route` — call Maps/Routing API, include night-time preference flag when request time is between 20:00–06:00 local time
+    - Fall back to standard route if routing API fails
+    - _Requirements: 3.1, 3.4, 3.5_
+  - [x] 8.2 Implement turn-by-turn guidance in route response
+    - Ensure route response includes a non-empty ordered `steps` array
+    - _Requirements: 3.2_
+  - [x] 8.3 Implement route deviation detection
+    - Compare current user position against route corridor; trigger recalculation when deviation is detected
+    - _Requirements: 3.3_
+  - [ ]* 8.4 Write property test for turn-by-turn steps (Property 8)
+    - **Property 8: Safe route contains turn-by-turn steps**
+    - **Validates: Requirements 3.2**
+  - [ ]* 8.5 Write property test for route deviation recalculation (Property 9)
+    - **Property 9: Route deviation triggers recalculation**
+    - **Validates: Requirements 3.3**
+  - [ ]* 8.6 Write property test for night-time route preference flag (Property 10)
+    - **Property 10: Night-time route preference flag**
+    - **Validates: Requirements 3.4**
+
+- [x] 9. Safety Module — Check-In System
+  - [x] 9.1 Implement check-in scheduling endpoint
+    - `POST /safety/checkin` — validate interval [5, 1440] min, create `CheckIn` record, schedule notification job
+    - _Requirements: 4.1, 4.4_
+  - [x] 9.2 Implement missed check-in alert
+    - After 5 minutes without confirmation, send alert to all emergency contacts including last known location
+    - _Requirements: 4.2, 4.5_
+  - [x] 9.3 Implement check-in confirmation endpoint
+    - `POST /safety/checkin/:id/confirm` — set `confirmedAt`, update status to `confirmed`, cancel pending alert jobs
+    - _Requirements: 4.3_
+  - [ ]* 9.4 Write property test for check-in scheduling creates notification job (Property 11)
+    - **Property 11: Check-in scheduling creates notification job**
+    - **Validates: Requirements 4.1**
+  - [ ]* 9.5 Write property test for missed check-in alert (Property 12)
+    - **Property 12: Missed check-in alert includes last known location**
+    - **Validates: Requirements 4.2, 4.5**
+  - [ ]* 9.6 Write property test for check-in confirmation cancels alerts (Property 13)
+    - **Property 13: Check-in confirmation cancels pending alerts**
+    - **Validates: Requirements 4.3**
+  - [ ]* 9.7 Write property test for check-in interval validation (Property 14)
+    - **Property 14: Check-in interval validation**
+    - **Validates: Requirements 4.4**
+
+- [x] 10. Safety Module — Safety Tips
+  - [x] 10.1 Implement safety tips endpoints
+    - `GET /safety/tips` with category filter and full-text search (results within 2 s)
+    - `PUT /safety/tips/:id/bookmark` — toggle bookmark for authenticated user
+    - Seed initial tip library with categories: `travel`, `home`, `digital`, `general`
+    - _Requirements: 7.1, 7.4, 7.5_
+  - [x] 10.2 Implement daily tip selection and location-specific tips
+    - On first daily app open, surface a contextually relevant tip
+    - When user location changes to a new region, surface region-matched tips
+    - _Requirements: 7.2, 7.3_
+  - [ ]* 10.3 Write property test for safety tips category filter (Property 22)
+    - **Property 22: Safety tips category filter**
+    - **Validates: Requirements 7.1**
+  - [ ]* 10.4 Write property test for location-specific safety tips (Property 23)
+    - **Property 23: Location-specific safety tips**
+    - **Validates: Requirements 7.3**
+  - [ ]* 10.5 Write property test for safety tip bookmark round-trip (Property 24)
+    - **Property 24: Safety tip bookmark round-trip**
+    - **Validates: Requirements 7.4**
+  - [ ]* 10.6 Write unit tests for daily tip and search
+    - Test first-daily-open tip display
+    - Test search returns results within 2 s
+    - _Requirements: 7.2, 7.5_
+
+- [x] 11. Checkpoint — Safety module complete
+  - Ensure all safety module tests pass, ask the user if questions arise.
+
+- [x] 12. Wellbeing Module — Mood Tracking
+  - [x] 12.1 Implement mood log submission endpoint
+    - `POST /wellbeing/mood` — validate mood value [1–5], note ≤ 500 chars; encrypt note at rest; record timestamp
+    - _Requirements: 6.1, 6.4, 9.3_
+  - [x] 12.2 Implement mood history endpoint
+    - `GET /wellbeing/mood?range=7|30|90` — return entries within the selected range only
+    - _Requirements: 6.2_
+  - [x] 12.3 Implement consecutive negative mood streak detection
+    - After each mood submission, check for 3+ consecutive calendar days with mood ≤ 2; flag streak and include wellbeing resource offer in response
+    - _Requirements: 6.3_
+  - [x] 12.4 Implement wellbeing summary endpoint
+    - `GET /wellbeing/summary` — generate 30-day mood trend summary from `MoodLog` data
+    - _Requirements: 6.5_
+  - [ ]* 12.5 Write property test for mood log round-trip (Property 18)
+    - **Property 18: Mood log round-trip**
+    - **Validates: Requirements 6.1**
+  - [ ]* 12.6 Write property test for mood history time-range filter (Property 19)
+    - **Property 19: Mood history time-range filter**
+    - **Validates: Requirements 6.2**
+  - [ ]* 12.7 Write property test for consecutive negative mood streak detection (Property 20)
+    - **Property 20: Consecutive negative mood streak detection**
+    - **Validates: Requirements 6.3**
+  - [ ]* 12.8 Write property test for mood note length validation (Property 21)
+    - **Property 21: Mood note length validation**
+    - **Validates: Requirements 6.4**
+
+- [x] 13. Productivity Module — Task Management
+  - [x] 13.1 Implement task CRUD endpoints
+    - `POST /productivity/tasks`, `GET /productivity/tasks`, `PUT /productivity/tasks/:id`, `DELETE /productivity/tasks/:id`
+    - Store `title`, optional `dueDate`, optional `priority`; default status `active`
+    - _Requirements: 8.1_
+  - [x] 13.2 Implement task due date notification job
+    - When a task with a `dueDate` is created or updated, schedule a notification job for that date
+    - _Requirements: 8.2_
+  - [x] 13.3 Implement task completion endpoint
+    - `POST /productivity/tasks/:id/complete` — set status to `completed`, record `completedAt`, exclude from `status=active` queries
+    - _Requirements: 8.3_
+  - [x] 13.4 Implement task filter and sort
+    - Support `?status=active|completed` and `?sort=dueDate|priority` query params
+    - _Requirements: 8.4_
+  - [ ]* 13.5 Write property test for task creation round-trip (Property 25)
+    - **Property 25: Task creation round-trip**
+    - **Validates: Requirements 8.1**
+  - [ ]* 13.6 Write property test for task due date notification job (Property 26)
+    - **Property 26: Task due date notification job**
+    - **Validates: Requirements 8.2**
+  - [ ]* 13.7 Write property test for completing a task removes it from active list (Property 27)
+    - **Property 27: Completing a task removes it from active list**
+    - **Validates: Requirements 8.3**
+  - [ ]* 13.8 Write property test for task filter and sort correctness (Property 28)
+    - **Property 28: Task filter and sort correctness**
+    - **Validates: Requirements 8.4**
+
+- [x] 14. Checkpoint — Wellbeing and Productivity modules
+  - Ensure all wellbeing and productivity tests pass, ask the user if questions arise.
+
+- [x] 15. AI Engine
+  - [x] 15.1 Implement AI message endpoint with Kiro AI integration
+    - `POST /ai/message` — forward message to Kiro AI API, return `{ reply, intent, suggestedActions[] }`
+    - Classify intent: `safety_concern`, `emotional_distress`, `task_creation`, `general`
+    - Return structured error `{ error: true, message, retryable: true }` on service failure
+    - _Requirements: 5.1, 5.5_
+  - [x] 15.2 Implement session-scoped conversation context in Redis
+    - Persist last 20 messages per session in Redis; attach context to each Kiro AI request
+    - _Requirements: 5.4_
+  - [x] 15.3 Implement intent-to-module routing
+    - `safety_concern` intent → include at least one Safety Module action in `suggestedActions`
+    - `emotional_distress` intent → include at least one Wellbeing Module action in `suggestedActions`
+    - `task_creation` intent → extract title, dueDate, priority and call `POST /productivity/tasks`
+    - Out-of-domain queries → acknowledge limitation and redirect to supported features
+    - _Requirements: 5.2, 5.3, 5.6, 8.5_
+  - [ ]* 15.4 Write property test for safety concern intent triggers safety suggestions (Property 15)
+    - **Property 15: Safety concern intent triggers safety suggestions**
+    - **Validates: Requirements 5.2**
+  - [ ]* 15.5 Write property test for emotional distress intent triggers wellbeing suggestions (Property 16)
+    - **Property 16: Emotional distress intent triggers wellbeing suggestions**
+    - **Validates: Requirements 5.3**
+  - [ ]* 15.6 Write property test for conversation context retention (Property 17)
+    - **Property 17: Conversation context retention**
+    - **Validates: Requirements 5.4**
+  - [ ]* 15.7 Write unit tests for AI Engine
+    - Test AI service error returns correct error shape
+    - Test out-of-domain query response
+    - Test AI-driven task creation calls Productivity Module
+    - _Requirements: 5.5, 5.6, 8.5_
+
+- [x] 16. React Native client — core screens and navigation
+  - [x] 16.1 Implement app navigation shell and auth screens
+    - Login, registration, and re-authentication (session lock) screens
+    - Session inactivity lock: lock UI after 10 min, present re-auth screen without clearing local data
+    - _Requirements: 9.1, 9.2_
+  - [x] 16.2 Implement SOS trigger UI
+    - Prominent SOS button on home screen; show confirmation banner after trigger; show cancel option during active event
+    - _Requirements: 1.3, 1.6_
+  - [x] 16.3 Implement Emergency Contacts management screen
+    - Add / edit / delete contacts with inline validation feedback
+    - _Requirements: 2.1, 2.2, 2.5_
+  - [x] 16.4 Implement AI Companion chat screen
+    - Message input, conversation history, suggested action chips from `suggestedActions`
+    - _Requirements: 5.1, 5.2, 5.3_
+  - [x] 16.5 Implement Mood Tracking screen
+    - 5-point mood selector, optional note field (500-char limit), mood history chart with 7/30/90-day toggle
+    - _Requirements: 6.1, 6.2, 6.4_
+  - [x] 16.6 Implement Task Management screen
+    - Task list with filter (active/completed) and sort (due date/priority); mark-complete action
+    - _Requirements: 8.1, 8.3, 8.4_
+  - [x] 16.7 Implement Safety Tips screen
+    - Category-filtered tip list, search bar, bookmark toggle, daily tip banner on first open
+    - _Requirements: 7.1, 7.2, 7.4, 7.5_
+  - [x] 16.8 Implement Check-In scheduling screen
+    - Schedule check-in with interval picker (5 min – 24 h); confirm check-in from notification or in-app
+    - _Requirements: 4.1, 4.3, 4.4_
+  - [x] 16.9 Implement Notification Settings screen
+    - Toggle each notification category independently; apply immediately without restart
+    - _Requirements: 10.2, 10.3_
+  - [x] 16.10 Implement push notification handler and in-app banner fallback
+    - Handle FCM/APNs payloads; show in-app banner when OS permission is denied
+    - _Requirements: 10.1, 10.4_
+
+- [x] 17. Checkpoint — Client screens
+  - Ensure all client-side unit tests pass, ask the user if questions arise.
+
+- [x] 18. Integration and wiring
+  - [x] 18.1 Wire AI Engine intent routing to module APIs end-to-end
+    - Verify that a `task_creation` message from the chat screen results in a stored task
+    - Verify that a `safety_concern` message surfaces SOS/route suggested actions in the UI
+    - _Requirements: 5.2, 5.3, 8.5_
+  - [x] 18.2 Wire SOS flow end-to-end
+    - Client SOS button → backend trigger → offline queue → alert dispatch → live location updates → cancel flow
+    - _Requirements: 1.1–1.6_
+  - [x] 18.3 Wire Check-In flow end-to-end
+    - Schedule → reminder notification → missed alert with location → confirmation cancels alert
+    - _Requirements: 4.1–4.5_
+  - [x] 18.4 Wire Notification Service across all modules
+    - Confirm SOS suppression, preference enforcement, and in-app fallback work across all notification types
+    - _Requirements: 10.1–10.5_
+  - [ ]* 18.5 Write integration tests for end-to-end flows
+    - SOS trigger → alert delivery → cancel
+    - Missed check-in → emergency contact alert
+    - AI task creation → task stored → due date notification scheduled
+    - _Requirements: 1.1, 4.2, 8.5_
+
+- [x] 19. Final checkpoint — Full test suite
+  - Ensure all unit, property, and integration tests pass, ask the user if questions arise.
+
+---
+
+## Notes
+
+- Tasks marked with `*` are optional and can be skipped for a faster MVP
+- Each task references specific requirements for traceability
+- Property tests use **fast-check** with `numRuns: 100` minimum and the tag comment `// Feature: nyra-ai-companion, Property {N}: {property_text}`
+- Checkpoints ensure incremental validation at each module boundary
